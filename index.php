@@ -1,9 +1,14 @@
 <?php
-// === CRÉATEUR DE PROJET (root index.php) ===
+// === CRÉATEUR DE PROJET INTELLIGENT (VERSION CORRIGÉE) ===
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+date_default_timezone_set('UTC');
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['prompt'])) {
     $prompt = trim($_POST['prompt']);
     
-    // Trouver le prochain ID
+    // Création d'un ID unique pour le projet
     $dirs = glob(__DIR__ . '/[0-9]*', GLOB_ONLYDIR);
     $max = 0;
     foreach ($dirs as $d) {
@@ -12,16 +17,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['prompt'])) {
     }
     $id = str_pad($max + 1, 9, '0', STR_PAD_LEFT);
     $projectPath = __DIR__ . '/' . $id;
-    mkdir($projectPath . '/apps', 0755, true);
+    $appsPath = $projectPath . '/apps';
     
-    // Sauvegarde du prompt
-    file_put_contents($projectPath . '/data.json', json_encode(['prompt' => $prompt], JSON_PRETTY_PRINT));
+    if (!mkdir($appsPath, 0755, true)) {
+        die("Erreur : impossible de créer le dossier du projet.");
+    }
     
-    // Initialisation de la base de données SQLite
+    // Sauvegarde du prompt utilisateur
+    file_put_contents($projectPath . '/data.json', json_encode(['prompt' => $prompt, 'created' => date('c')], JSON_PRETTY_PRINT));
+    
+    // Initialisation SQLite
     try {
         $db = new SQLite3($projectPath . '/database.db');
         $db->exec("CREATE TABLE IF NOT EXISTS site_config (key TEXT PRIMARY KEY, value TEXT)");
         $db->exec("CREATE TABLE IF NOT EXISTS rl_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             task TEXT,
             errors TEXT,
             fixes TEXT,
@@ -45,18 +55,21 @@ ini_set('log_errors', 1);
 ini_set('error_log', __DIR__ . '/orchestrator_errors.log');
 
 $DIR = __DIR__;
+$APPS_DIR = $DIR . '/apps';
 
-// === VOS 3 CLÉS API MISTRAL (remplacer par les vraies) ===
-$MISTRAL_KEYS = ['hgfUjGJpAk5z35XhgfZbH8Rake','o3rhgfzvdhgfhgf4J3J3eHXRShytu','vEzQMKNhgfhgf8J30ENDjFruXkF'];
-
-
+// === VOS CLÉS API MISTRAL (À REMPLACER PAR LES VRAIES) ===
+$MISTRAL_KEYS = [
+    '5qaRTjWhdhtudXcdEP5ZbH8Rake',
+    'hgfo3rG1zvhgf3J3eHXRShytu',
+    'vEhzQMKN74EhfhJ30ENDhfjFruXkF'
+];
 
 $MISTRAL_CONFIG = [
     'keys' => $MISTRAL_KEYS,
     'current_index' => 0,
-    'default_model' => 'magistral-small-2509',
-    'deep_model' => 'mistral-large-2411',
-    'critique_model' => 'mistral-large-2512'
+    'default_model' => 'mistral-small-2503',
+    'deep_model'    => 'mistral-large-2411',
+    'critique_model'=> 'mistral-large-2411'
 ];
 
 $stateFile = $DIR . '/state.json';
@@ -67,16 +80,17 @@ if (!file_exists($stateFile)) {
         'retry_count' => 0,
         'score' => 0,
         'done' => false,
-        'plan' => null
+        'plan' => null,
+        'files' => 0
     ], JSON_PRETTY_PRINT), LOCK_EX);
 }
 $state = json_decode(file_get_contents($stateFile), true);
 
-// === INITIALISATION DB ===
+// === FONCTIONS DB ===
 function initDB() {
     $db = new SQLite3(__DIR__ . '/database.db');
     $db->exec("CREATE TABLE IF NOT EXISTS site_config (key TEXT PRIMARY KEY, value TEXT)");
-    $db->exec("CREATE TABLE IF NOT EXISTS rl_memory (task TEXT, errors TEXT, fixes TEXT, success INTEGER, ts TEXT)");
+    $db->exec("CREATE TABLE IF NOT EXISTS rl_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT, errors TEXT, fixes TEXT, success INTEGER, ts TEXT)");
     return $db;
 }
 function getDB() {
@@ -89,15 +103,17 @@ function getPrompt() {
     return ($res !== false && $res !== null) ? $res : 'Site générique';
 }
 function getRL() {
-    $result = getDB()->query("SELECT task, errors, fixes, success FROM rl_memory ORDER BY rowid DESC LIMIT 5");
+    $result = getDB()->query("SELECT task, errors, fixes, success FROM rl_memory ORDER BY id DESC LIMIT 5");
     if (!$result) return "Aucun historique.";
     $rows = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) $rows[] = $row;
-    return empty($rows) ? "Aucun historique." : "HISTORIQUE RL :\n" . implode("\n", array_map(fn($d) => 
-        "- Tâche: {$d['task']} | Erreurs: {$d['errors']} | Fix: {$d['fixes']} | Succès: " . ($d['success'] ? 'Oui' : 'Non'), $rows));
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $rows[] = "- Tâche: {$row['task']} | Erreurs: {$row['errors']} | Fix: {$row['fixes']} | Succès: " . ($row['success'] ? 'Oui' : 'Non');
+    }
+    return empty($rows) ? "Aucun historique." : "HISTORIQUE RL :\n" . implode("\n", $rows);
 }
 function saveRL($task, $err, $fix, $suc) {
-    $stmt = getDB()->prepare("INSERT INTO rl_memory (task, errors, fixes, success, ts) VALUES (?, ?, ?, ?, ?)");
+    $db = getDB();
+    $stmt = $db->prepare("INSERT INTO rl_memory (task, errors, fixes, success, ts) VALUES (?, ?, ?, ?, ?)");
     if (!$stmt) return;
     $stmt->bindValue(1, $task);
     $stmt->bindValue(2, $err);
@@ -107,10 +123,10 @@ function saveRL($task, $err, $fix, $suc) {
     $stmt->execute();
 }
 
-// === APPEL MISTRAL AVEC ROTATION DES CLÉS ET GESTION 429 ===
-function mistral($messages, $model = 'mistral-small-2506', $maxTokens = 4096, $retry = true) {
+// === APPEL MISTRAL AVEC ROTATION ET GESTION 429 ===
+function mistral($messages, $model, $maxTokens = 4096) {
     global $MISTRAL_KEYS, $MISTRAL_CONFIG;
-    $maxAttempts = count($MISTRAL_KEYS) * 3; // 3 essais max par clé
+    $maxAttempts = count($MISTRAL_KEYS) * 2;
     $lastError = null;
     
     for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
@@ -129,7 +145,7 @@ function mistral($messages, $model = 'mistral-small-2506', $maxTokens = 4096, $r
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $key],
             CURLOPT_POSTFIELDS => json_encode($payload),
-            CURLOPT_TIMEOUT => 300,
+            CURLOPT_TIMEOUT => 180,
             CURLOPT_CONNECTTIMEOUT => 30
         ]);
         $response = curl_exec($ch);
@@ -140,106 +156,127 @@ function mistral($messages, $model = 'mistral-small-2506', $maxTokens = 4096, $r
             $data = json_decode($response, true);
             if (isset($data['choices'][0]['message']['content'])) {
                 $content = $data['choices'][0]['message']['content'];
-                $finishReason = $data['choices'][0]['finish_reason'] ?? '';
-                if ($finishReason === 'length' && $retry && $maxTokens < 32000) {
-                    error_log("Troncature, réessai avec plus de tokens");
-                    return mistral($messages, $model, $maxTokens * 2, false);
-                }
+                // Extraction du JSON (certains modèles ajoutent du texte avant)
                 if (preg_match('/\{.*\}/s', $content, $matches)) {
                     $json = json_decode($matches[0], true);
                     if ($json !== null) {
+                        // Rotation vers la clé suivante
                         $MISTRAL_CONFIG['current_index'] = ($keyIndex + 1) % count($MISTRAL_KEYS);
                         return $json;
                     }
                 }
                 $lastError = "JSON invalide : " . substr($content, 0, 200);
             } else {
-                $lastError = "Structure inattendue";
+                $lastError = "Structure de réponse inattendue";
             }
         } elseif ($httpCode === 429) {
-            $wait = min(30, pow(2, $attempt % 5));
-            error_log("Rate limit sur clé $keyIndex, attente {$wait}s avant réessai (tentative $attempt)");
+            $wait = min(30, pow(2, $attempt % 4));
+            error_log("Rate limit sur clé $keyIndex, attente {$wait}s (tentative $attempt)");
             sleep($wait);
-            continue; // réessai avec la même clé ou la suivante
+            continue;
         } else {
             $lastError = "HTTP $httpCode, réponse: " . substr($response, 0, 200);
         }
         error_log($lastError);
     }
-    throw new Exception('Échec après plusieurs tentatives. Dernière erreur : ' . $lastError);
+    throw new Exception("Échec après $maxAttempts tentatives. Dernière erreur : $lastError");
 }
 
 // === ROUTEUR AJAX ===
 if (isset($_REQUEST['action'])) {
-    set_time_limit(0);
+    set_time_limit(300);
     ob_clean();
     header('Content-Type: application/json');
     $action = $_REQUEST['action'];
     $out = ['log' => '', 'status' => $state['status'], 'done' => false, 'error' => false];
+    
     try {
         $prompt = getPrompt();
+        
         switch ($action) {
             case 'start':
                 $state['status'] = 'planning';
                 $state['prompt'] = $prompt;
                 file_put_contents($stateFile, json_encode($state), LOCK_EX);
-                $out['log'] = "🔗 Analyse de la demande : \"$prompt\"";
+                $out['log'] = "🔍 Analyse de la demande : \"$prompt\"";
                 break;
+                
             case 'plan':
-                $system = "Architecte web. Réponds JSON : {\"sitemap\": [\"index.html\",...], \"tech\": \"html/css/js/php\", \"notes\": \"...\"}";
+                $system = "Tu es un architecte web expert. Réponds UNIQUEMENT en JSON valide avec cette structure : {\"sitemap\": [\"index.html\", ...], \"tech\": \"html/css/js/php\", \"notes\": \"...\"}";
                 $user = "Projet : $prompt\n" . getRL();
-                $plan = mistral([['role'=>'system','content'=>$system],['role'=>'user','content'=>$user]], $MISTRAL_CONFIG['deep_model'], 2048);
-                if (!isset($plan['sitemap'])) $plan['sitemap'] = ['index.html'];
+                $plan = mistral([['role'=>'system','content'=>$system], ['role'=>'user','content'=>$user]], $GLOBALS['MISTRAL_CONFIG']['deep_model'], 2048);
+                if (!isset($plan['sitemap']) || !is_array($plan['sitemap'])) {
+                    $plan['sitemap'] = ['index.html'];
+                }
+                if (!isset($plan['tech'])) $plan['tech'] = 'html/css/js/php';
+                if (!isset($plan['notes'])) $plan['notes'] = 'Site généré automatiquement.';
                 $state['plan'] = $plan;
                 $state['status'] = 'coding';
                 file_put_contents($stateFile, json_encode($state), LOCK_EX);
-                $out['log'] = "📐 Plan reçu : " . count($plan['sitemap']) . " page(s). Codage...";
+                $out['log'] = "📐 Plan reçu : " . count($plan['sitemap']) . " page(s). Passage au codage...";
                 break;
+                
             case 'code':
-                $system = "Développeur full-stack. Générez TOUS les fichiers nécessaires. Réponse JSON : {\"files\": [{\"path\":\"apps/index.html\",\"content\":\"...\"}]}";
-                $user = "Plan :\n" . json_encode($state['plan'], JSON_PRETTY_PRINT) . "\n" . getRL();
-                $code = mistral([['role'=>'system','content'=>$system],['role'=>'user','content'=>$user]], $MISTRAL_CONFIG['default_model'], 16384);
+                $system = "Tu es un développeur full-stack. Génére TOUS les fichiers nécessaires pour le site. Réponse JSON : {\"files\": [{\"path\":\"apps/index.html\",\"content\":\"...\"}, ...]} IMPORTANT : tous les chemins doivent commencer par 'apps/' (ex: apps/style.css). Contenu complet et fonctionnel.";
+                $user = "Plan du site :\n" . json_encode($state['plan'], JSON_PRETTY_PRINT) . "\n\n" . getRL();
+                $code = mistral([['role'=>'system','content'=>$system], ['role'=>'user','content'=>$user]], $GLOBALS['MISTRAL_CONFIG']['default_model'], 16384);
                 $written = 0;
                 if (!empty($code['files']) && is_array($code['files'])) {
-                    foreach ($code['files'] as $f) {
-                        $path = $DIR . '/' . ltrim($f['path'], '/');
-                        @mkdir(dirname($path), 0755, true);
-                        if (file_put_contents($path, $f['content'])) $written++;
-                        else error_log("Impossible d'écrire : $path");
+                    foreach ($code['files'] as $file) {
+                        if (!isset($file['path']) || !isset($file['content'])) continue;
+                        // Forcer le chemin à commencer par apps/ si ce n'est pas déjà le cas
+                        $relPath = ltrim($file['path'], '/');
+                        if (strpos($relPath, 'apps/') !== 0) {
+                            $relPath = 'apps/' . $relPath;
+                        }
+                        $fullPath = $DIR . '/' . $relPath;
+                        $dir = dirname($fullPath);
+                        if (!is_dir($dir)) mkdir($dir, 0755, true);
+                        if (file_put_contents($fullPath, $file['content'])) {
+                            $written++;
+                        } else {
+                            error_log("Échec écriture : $fullPath");
+                        }
                     }
                 }
                 $state['files'] = $written;
                 $state['status'] = 'testing';
                 file_put_contents($stateFile, json_encode($state), LOCK_EX);
-                $out['log'] = $written ? "💾 $written fichiers écrits. Tests..." : "⚠️ Aucun fichier généré. Nouvel essai...";
-                if (!$written && ($state['retry_count'] ?? 0) < 3) {
+                $out['log'] = $written ? "💾 $written fichiers écrits. Démarrage des tests..." : "⚠️ Aucun fichier généré. Nouvel essai...";
+                if (!$written && ($state['retry_count'] ?? 0) < 2) {
                     $state['retry_count'] = ($state['retry_count'] ?? 0) + 1;
                     $state['status'] = 'coding';
                     file_put_contents($stateFile, json_encode($state), LOCK_EX);
                 }
                 break;
+                
             case 'test':
                 $score = 100;
-                $errors = '';
-                // Vérification syntaxique PHP
-                foreach (glob($DIR."/apps/*.php") as $f) {
-                    exec("php -l ".escapeshellarg($f)." 2>&1", $outp, $ret);
-                    if ($ret !== 0) {
+                $errors = "";
+                // Test syntaxique PHP
+                foreach (glob($APPS_DIR . "/*.php") as $phpFile) {
+                    exec("php -l " . escapeshellarg($phpFile) . " 2>&1", $output, $returnCode);
+                    if ($returnCode !== 0) {
                         $score -= 15;
-                        $errors .= "Syntaxe PHP dans ".basename($f)."\n".implode("\n",$outp)."\n";
+                        $errors .= "Erreur PHP dans " . basename($phpFile) . " : " . implode("\n", $output) . "\n";
                     }
                 }
-                // QA par Mistral
-                $filesContent = "";
-                foreach (glob($DIR."/apps/*") as $f) {
-                    if (is_file($f)) $filesContent .= basename($f)." :\n".file_get_contents($f)."\n---\n";
+                // Lecture de tous les fichiers générés pour QA
+                $allFilesContent = "";
+                foreach (glob($APPS_DIR . "/*") as $f) {
+                    if (is_file($f)) {
+                        $allFilesContent .= "=== " . basename($f) . " ===\n" . file_get_contents($f) . "\n\n";
+                    }
                 }
-                $qa = mistral([['role'=>'system','content'=>'QA expert. Réponds JSON : {"score":0-100,"errors":"...","fixes":"..."}'],
-                               ['role'=>'user','content'=>"Code :\n$filesContent\n".getRL()]], $MISTRAL_CONFIG['critique_model'], 4096);
+                // Appel QA à Mistral
+                $qaSystem = "QA expert. Réponds JSON : {\"score\":0-100,\"errors\":\"...\",\"fixes\":\"...\"}";
+                $qaUser = "Voici le code généré :\n$allFilesContent\n" . getRL();
+                $qa = mistral([['role'=>'system','content'=>$qaSystem], ['role'=>'user','content'=>$qaUser]], $GLOBALS['MISTRAL_CONFIG']['critique_model'], 4096);
                 $score = min(100, $score + ($qa['score'] ?? 0));
-                $errors .= ($qa['errors'] ?? "")."\n";
+                $errors .= ($qa['errors'] ?? "") . "\n";
                 $fixes = $qa['fixes'] ?? "Optimisations mineures.";
                 $state['score'] = $score;
+                
                 if ($score < 85 && ($state['retry_count'] ?? 0) < 3) {
                     $state['retry_count'] = ($state['retry_count'] ?? 0) + 1;
                     $state['status'] = 'coding';
@@ -250,12 +287,15 @@ if (isset($_REQUEST['action'])) {
                     $state['status'] = 'done';
                     $state['done'] = true;
                     file_put_contents($stateFile, json_encode($state), LOCK_EX);
-                    saveRL($prompt, $errors ?: "Aucune", $fixes, true);
-                    $out['log'] = "✅ Site validé ($score/100). Prêt !";
+                    saveRL($prompt, $errors ?: "Aucune erreur détectée", $fixes, true);
+                    $out['log'] = "✅ Site validé (score $score/100). Prêt à être consulté !";
                     $out['done'] = true;
                 }
                 break;
-            default: $out['error'] = true; $out['log'] = "Action inconnue.";
+                
+            default:
+                $out['error'] = true;
+                $out['log'] = "Action inconnue.";
         }
     } catch (Exception $e) {
         $out['log'] = "❌ " . $e->getMessage();
@@ -271,7 +311,7 @@ if (isset($_REQUEST['action'])) {
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Console du projet</title>
+    <title>Console du projet - Génération IA</title>
     <style>
         :root{--bg:#050505;--txt:#00ff9d;--err:#ff4444;--brd:#222}
         *{margin:0;padding:0;box-sizing:border-box}
@@ -295,6 +335,7 @@ if (isset($_REQUEST['action'])) {
     const ctrlDiv = document.getElementById('controls');
     const steps = ['start', 'plan', 'code', 'test'];
     let stepIndex = 0, running = true;
+    
     function log(msg, isErr=false) {
         const line = document.createElement('div');
         if (isErr) line.className = 'error';
@@ -302,25 +343,27 @@ if (isset($_REQUEST['action'])) {
         consoleDiv.appendChild(line);
         consoleDiv.scrollTop = consoleDiv.scrollHeight;
     }
+    
     async function call(action, retries=3) {
         for (let attempt=1; attempt<=retries; attempt++) {
             try {
-                const ctrl = new AbortController();
-                const timer = setTimeout(() => ctrl.abort(), 180000);
-                const resp = await fetch(`?action=${action}`, { signal: ctrl.signal });
-                clearTimeout(timer);
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 200000);
+                const resp = await fetch(`?action=${action}`, { signal: controller.signal });
+                clearTimeout(timeout);
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                const txt = await resp.text();
+                const text = await resp.text();
                 let data;
-                try { data = JSON.parse(txt); } catch(e) { throw new Error('JSON invalide'); }
+                try { data = JSON.parse(text); } catch(e) { throw new Error('Réponse JSON invalide'); }
                 return data;
             } catch(e) {
                 log(`⚠️ Tentative ${attempt}/${retries} échouée : ${e.message}`, true);
                 if (attempt === retries) throw e;
-                await new Promise(r => setTimeout(r, 2000*attempt));
+                await new Promise(r => setTimeout(r, 2000 * attempt));
             }
         }
     }
+    
     async function run() {
         if (!running || stepIndex >= steps.length) {
             running = false;
@@ -340,6 +383,7 @@ if (isset($_REQUEST['action'])) {
                 consoleDiv.classList.remove('cursor');
                 return;
             }
+            // Gestion des reprises automatiques
             if (result.status === 'coding' && step === 'test') {
                 stepIndex = steps.indexOf('code');
             } else {
@@ -353,6 +397,7 @@ if (isset($_REQUEST['action'])) {
         }
         setTimeout(run, 800);
     }
+    
     window.addEventListener('DOMContentLoaded', () => {
         log('🖥️ Console active. Démarrage de la génération...');
         run();
@@ -361,7 +406,8 @@ if (isset($_REQUEST['action'])) {
 </body>
 </html>
 PHP;
-
+    
+    // Écriture de l'orchestrateur dans le projet
     file_put_contents($projectPath . '/console.php', $orchestrator);
     
     // Redirection vers la console du projet
